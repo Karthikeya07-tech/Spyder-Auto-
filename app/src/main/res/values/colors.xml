@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="spyder_black">#FF000000</color>
+    <color name="spyder_white">#FFFFFFFF</color>
+    <color name="spyder_red">#FFE10600</color>
+    <color name="spyder_maroon">#FF6E1423</color>
+    <color name="spyder_background">#FF140406</color>
+</resources>
