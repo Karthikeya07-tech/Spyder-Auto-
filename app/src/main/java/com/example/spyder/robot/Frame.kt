@@ -7,7 +7,7 @@ import kotlin.math.sqrt
 
 /**
  * Robot frame: +X is forward, +Y is left, yaw is degrees counter-clockwise from +X.
- * On screen +X is up and +Y is left, so a calibrated nose points up.
+ * On screen +X is right and +Y is up, matching a plot with forward on the horizontal axis.
  * scan index i is i degrees counter-clockwise from the nose. 0 mm is no hit.
  * The occupancy grid is row-major, column along +X and row along +Y, centred on (0, 0).
  */
@@ -40,8 +40,8 @@ object Frame {
         pixelsPerMetre: Float
     ): ScreenPoint {
         return ScreenPoint(
-            x = centerX + panX - (point.y * pixelsPerMetre).toFloat(),
-            y = centerY + panY - (point.x * pixelsPerMetre).toFloat()
+            x = centerX + panX + (point.x * pixelsPerMetre).toFloat(),
+            y = centerY + panY - (point.y * pixelsPerMetre).toFloat()
         )
     }
 
@@ -51,24 +51,22 @@ object Frame {
         return if (side * side == bytes.size) side else null
     }
 
-    /** Pixel in a bitmap whose +X points up and +Y points left. */
+    /** Pixel in a bitmap whose +X points right and +Y points up. */
     fun cellPixel(col: Int, row: Int, size: Int): Pair<Int, Int> {
-        val px = size - 1 - row
-        val py = size - 1 - col
+        val px = col
+        val py = size - 1 - row
         return px to py
     }
 
+    fun wallCount(cells: ByteArray): Int = cells.count { it.toInt() > 0 }
+
     fun occupancyArgb(logOdds: Int): Int {
-        if (logOdds == 0) return 0
-        if (logOdds > 0) {
-            val strength = logOdds.coerceIn(1, 80) / 80f
-            val alpha = (170 + 85f * strength).toInt().coerceIn(0, 255)
-            return (alpha shl 24) or 0x00FFFFFF
-        }
-        val strength = (-logOdds).coerceIn(1, 80) / 80f
-        val red = (36 + 28f * strength).toInt()
-        val green = (10 + 8f * strength).toInt()
-        val blue = (16 + 10f * strength).toInt()
+        if (logOdds > 0) return opaque(0x14, 0x14, 0x14)
+        if (logOdds < 0) return opaque(0xFF, 0xFF, 0xFF)
+        return opaque(0xC8, 0xC8, 0xC8)
+    }
+
+    private fun opaque(red: Int, green: Int, blue: Int): Int {
         return (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
     }
 

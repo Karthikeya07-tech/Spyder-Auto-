@@ -16,6 +16,14 @@ data class StatusSnapshot(
     }
 }
 
+data class ActionSnapshot(
+    val busy: Boolean?,
+    val current: String?,
+    val queued: List<String>,
+    val sawCurrent: Boolean,
+    val sawQueued: Boolean
+)
+
 data class LiveFrame(
     val x: Double?,
     val y: Double?,
@@ -88,6 +96,19 @@ object RobotJson {
             scanMm = scan,
             mapVersion = version,
             streaming = flag(root, "stream", "streaming")
+        )
+    }
+
+    fun action(body: String): ActionSnapshot? {
+        val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
+        val sawCurrent = root.has("current") || root.has("action")
+        val sawQueued = root.has("queued") || root.has("action_queued")
+        return ActionSnapshot(
+            busy = flag(root, "busy", "action_busy"),
+            current = actionName(root, "current", "action"),
+            queued = actionList(root, "queued", "action_queued") ?: emptyList(),
+            sawCurrent = sawCurrent,
+            sawQueued = sawQueued
         )
     }
 
@@ -181,6 +202,37 @@ object RobotJson {
             val parts = value.split(',')
             IntArray(parts.size) { index -> parts[index].trim().toDoubleOrNull()?.toInt() ?: 0 }
         }
+        else -> null
+    }
+
+    private fun actionName(source: JSONObject, vararg keys: String): String? {
+        for (key in keys) {
+            if (!source.has(key) || source.isNull(key)) continue
+            nameOf(source.get(key))?.let { return it }
+        }
+        return null
+    }
+
+    private fun actionList(source: JSONObject, vararg keys: String): List<String>? {
+        for (key in keys) {
+            if (!source.has(key) || source.isNull(key)) continue
+            return when (val value = source.get(key)) {
+                is JSONArray -> buildList {
+                    for (index in 0 until value.length()) {
+                        nameOf(value.opt(index))?.let { add(it) }
+                    }
+                }
+                is String -> listOfNotNull(nameOf(value))
+                is JSONObject -> listOfNotNull(nameOf(value))
+                else -> emptyList()
+            }
+        }
+        return null
+    }
+
+    private fun nameOf(value: Any?): String? = when (value) {
+        is String -> value.trim().ifBlank { null }
+        is JSONObject -> actionName(value, "name", "action")
         else -> null
     }
 

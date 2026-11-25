@@ -14,6 +14,11 @@ object RobotEndpoint {
     const val CALIBRATE = "/api/imu/calibrate"
     const val ZERO = "/api/imu/zero"
     const val RESET = "/api/map/reset"
-    const val START = "/api/stream/start"
-    const val STOP = "/api/stream/stop"
+    const val SCAN_START = "/api/scan/start"
+    const val SCAN_STOP = "/api/scan/stop"
+    const val STREAM_START = "/api/stream/start"
+    const val STREAM_STOP = "/api/stream/stop"
+    const val ACTION = "/api/action"
+
+    fun action(name: String): String = "/api/action/$name"
 }

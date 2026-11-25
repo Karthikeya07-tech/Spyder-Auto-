@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBars
@@ -57,7 +58,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.spyder.robot.RobotEndpoint
-import com.example.spyder.ui.theme.NoseTeal
 import com.example.spyder.ui.theme.ScanOrange
 import com.example.spyder.ui.theme.SpyderBackground
 import com.example.spyder.ui.theme.SpyderBlack
@@ -69,7 +69,7 @@ import kotlinx.coroutines.delay
 import java.util.Locale
 
 private const val HINT =
-    "Hold the robot still, then Calibrate front. The teal arrow is the nose. Orange dots are the live scan. Walls fill in as you turn."
+    "Tap Start scan. The motor stays off until then. Hold still, then Calibrate front. The blue arrow is the heading. Red A is the start. Orange dots are the live scan."
 
 @Composable
 fun RobotScreen(
@@ -79,7 +79,8 @@ fun RobotScreen(
     onZero: () -> Unit,
     onResetMap: () -> Unit,
     onStart: () -> Unit,
-    onStop: () -> Unit
+    onStop: () -> Unit,
+    onAction: (String) -> Unit
 ) {
     val view = LocalView.current
     DisposableEffect(state.link) {
@@ -108,6 +109,7 @@ fun RobotScreen(
                 onResetMap = onResetMap,
                 onStart = onStart,
                 onStop = onStop,
+                onAction = onAction,
                 modifier = Modifier.weight(1f)
             )
         } else {
@@ -165,6 +167,7 @@ private fun LivePane(
     onResetMap: () -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onAction: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -203,6 +206,7 @@ private fun LivePane(
             scanMm = state.scanMm,
             occupancy = state.occupancy,
             mapSize = state.mapSize,
+            mapStamp = state.mapStamp,
             resolutionM = state.resolutionM,
             modifier = Modifier
                 .weight(1f)
@@ -210,14 +214,18 @@ private fun LivePane(
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         )
         Row(
-            modifier = Modifier.padding(horizontal = 16.dp),
+            modifier = Modifier
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            Legend(NoseTeal, "Nose")
+            Legend(Color.White, "Free")
+            Legend(Color.Black, "Wall")
+            Legend(Color(0xFFE10600), "A")
+            Legend(Color(0xFF2F6FE4), "Nose")
             Legend(ScanOrange, "Scan")
-            Legend(SpyderWhite, "Wall")
             Text(
-                text = "+X up  ·  +Y left",
+                text = "+X right  ·  +Y up",
                 color = SpyderWhite.copy(alpha = 0.6f),
                 fontSize = 11.sp,
                 modifier = Modifier.align(Alignment.CenterVertically)
@@ -225,6 +233,8 @@ private fun LivePane(
         }
         Column(
             modifier = Modifier
+                .heightIn(max = 340.dp)
+                .verticalScroll(rememberScrollState())
                 .fillMaxWidth()
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -296,6 +306,50 @@ private fun LivePane(
                     modifier = Modifier.weight(1f)
                 )
             }
+            Text(
+                text = actionLine(state),
+                color = SpyderWhite,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp
+            )
+            val motionReady = ready && !queueFull(state)
+            Choice(
+                text = "Forward",
+                filled = state.actionCurrent == "walk_forward",
+                enabled = motionReady,
+                onClick = { onAction("walk_forward") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Choice(
+                    text = "Left",
+                    filled = state.actionCurrent == "turn_left",
+                    enabled = motionReady,
+                    onClick = { onAction("turn_left") },
+                    modifier = Modifier.weight(1f)
+                )
+                Choice(
+                    text = "Neutral",
+                    filled = state.actionCurrent == "neutral",
+                    enabled = motionReady,
+                    onClick = { onAction("neutral") },
+                    modifier = Modifier.weight(1f)
+                )
+                Choice(
+                    text = "Right",
+                    filled = state.actionCurrent == "turn_right",
+                    enabled = motionReady,
+                    onClick = { onAction("turn_right") },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            Choice(
+                text = "Back",
+                filled = state.actionCurrent == "walk_backward",
+                enabled = motionReady,
+                onClick = { onAction("walk_backward") },
+                modifier = Modifier.fillMaxWidth()
+            )
         }
     }
 }
@@ -316,12 +370,13 @@ private fun StatusRow(state: RobotUiState, fresh: Boolean) {
         Chip(formatYaw(state.yawDeg), on = state.yawDeg != null)
         Chip(
             label = when {
+                state.streaming != true -> "Idle"
                 state.lastPacketMs == 0L -> if (state.usingSocket) "Socket" else "Link"
                 fresh -> if (state.usingSocket) "Socket" else "Poll"
                 else -> "No packets"
             },
-            on = fresh,
-            warn = state.lastPacketMs > 0 && !fresh
+            on = state.streaming == true && fresh,
+            warn = state.streaming == true && state.lastPacketMs > 0 && !fresh
         )
     }
 }
@@ -410,8 +465,8 @@ private fun JoinPane(
                     )
                 }
                 Step("1", "Connect, then confirm Twist-auto on the system dialog.")
-                Step("2", "Hold the robot still and tap Calibrate front.")
-                Step("3", "Turn in place. Orange dots are the scan. Walls fill in as you go.")
+                Step("2", "Tap Start scan. Nothing is live until the motor spins.")
+                Step("3", "Hold still, calibrate front, and turn. Walls fill in as you go.")
                 val message = notice?.takeIf { it.isNotBlank() } ?: state.detail
                 if (message.isNotBlank()) {
                     Text(
@@ -586,6 +641,30 @@ private fun networkLine(ssid: String?): String = when {
     ssid.isNullOrBlank() -> "Wi-Fi network not reported yet"
     ssid == RobotEndpoint.SSID -> "Phone is on Twist-auto"
     else -> "Phone is on $ssid"
+}
+
+private fun queueFull(state: RobotUiState): Boolean {
+    return state.actionBusy == true && state.actionQueued.size >= 2
+}
+
+private fun actionLine(state: RobotUiState): String {
+    val now = state.actionCurrent?.let(::motionLabel)
+    val waiting = state.actionQueued.map(::motionLabel)
+    return when {
+        now == null && waiting.isEmpty() -> "No move playing. One runs, two can wait."
+        now != null && waiting.isEmpty() -> "Now $now"
+        now != null -> "Now $now · waiting ${waiting.joinToString(", ")}"
+        else -> "Waiting ${waiting.joinToString(", ")}"
+    }
+}
+
+private fun motionLabel(name: String): String = when (name) {
+    "neutral" -> "Neutral"
+    "walk_forward" -> "Forward"
+    "walk_backward" -> "Back"
+    "turn_left" -> "Left"
+    "turn_right" -> "Right"
+    else -> name
 }
 
 private fun formatYaw(yaw: Double?): String {

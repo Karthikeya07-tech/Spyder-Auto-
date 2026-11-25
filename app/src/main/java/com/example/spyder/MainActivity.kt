@@ -33,7 +33,8 @@ class MainActivity : ComponentActivity() {
                     onZero = robot::zero,
                     onResetMap = robot::resetMap,
                     onStart = robot::startStream,
-                    onStop = robot::stopStream
+                    onStop = robot::stopStream,
+                    onAction = robot::play
                 )
             }
         }

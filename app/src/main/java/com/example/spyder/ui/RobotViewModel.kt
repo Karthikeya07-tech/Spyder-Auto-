@@ -5,6 +5,7 @@ import android.net.Network
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.spyder.robot.ActionSnapshot
 import com.example.spyder.robot.Frame
 import com.example.spyder.robot.RobotClient
 import com.example.spyder.robot.RobotEndpoint
@@ -33,8 +34,9 @@ class RobotViewModel(app: Application) : AndroidViewModel(app) {
     private var activeNetwork: Network? = null
     private var liveJob: Job? = null
     private var mapJob: Job? = null
-    private var mapGeneration = 0
-    private var fetchedVersion = Long.MIN_VALUE
+    private var actionJob: Job? = null
+    private var seenMapVersion = Long.MIN_VALUE
+    private var mapFollowUp = false
 
     @Volatile
     private var joining = false
@@ -43,7 +45,7 @@ class RobotViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             if (joining) return@launch
             _state.update { it.copy(ssid = wifi.ssid()) }
-            if (isFresh()) return@launch
+            if (isLinked()) return@launch
             _state.update { current ->
                 if (current.link == LinkState.RequestingWifi || current.link == LinkState.Live) {
                     current
@@ -76,7 +78,7 @@ class RobotViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             gate.withLock {
-                if (joining || isFresh()) {
+                if (joining || isLinked()) {
                     found.client.close()
                     return@withLock
                 }
@@ -132,34 +134,111 @@ class RobotViewModel(app: Application) : AndroidViewModel(app) {
     fun calibrate() = command(
         RobotEndpoint.CALIBRATE,
         "calibrate",
-        "Front set. The teal arrow is the nose."
+        "Front set. The blue arrow points forward."
     )
 
     fun zero() = command(RobotEndpoint.ZERO, "zero", "Arrow zeroed")
 
     fun resetMap() = command(RobotEndpoint.RESET, "reset", "Map cleared") {
-        fetchedVersion = Long.MIN_VALUE
-        _state.update { it.copy(occupancy = ByteArray(0), mapSize = 0, mapVersion = -1) }
-        client?.let { refreshMap(it, null) }
+        _state.update {
+            it.copy(occupancy = ByteArray(0), mapSize = 0, mapVersion = -1, mapStamp = it.mapStamp + 1)
+        }
     }
 
-    fun startStream() = command(
-        RobotEndpoint.START,
-        "start",
-        "LiDAR spinning",
-        streaming = true
-    )
+    fun startStream() {
+        val bound = client
+        if (bound == null) {
+            _state.update { it.copy(detail = "Connect to Twist-auto first") }
+            return
+        }
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true, detail = "Starting scan") }
+            val result = withContext(Dispatchers.IO) {
+                runCatching { postScan(bound, RobotEndpoint.SCAN_START, RobotEndpoint.STREAM_START) }
+            }
+            if (result.isFailure) {
+                val failure = result.exceptionOrNull()
+                _state.update {
+                    it.copy(
+                        busy = false,
+                        streaming = false,
+                        detail = failure?.let(::friendly) ?: "Could not start the scan"
+                    )
+                }
+                return@launch
+            }
+            seenMapVersion = Long.MIN_VALUE
+            _state.update {
+                it.copy(
+                    busy = false,
+                    streaming = true,
+                    detail = "Scan started. The motor is spinning."
+                )
+            }
+            startLive(bound)
+        }
+    }
 
-    fun stopStream() = command(
-        RobotEndpoint.STOP,
-        "stop",
-        "LiDAR motor off",
-        streaming = false
-    )
+    fun play(name: String) {
+        val bound = client
+        if (bound == null) {
+            _state.update { it.copy(detail = "Connect to Twist-auto first") }
+            return
+        }
+        val label = motionLabel(name)
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true, detail = "Queuing $label") }
+            val result = withContext(Dispatchers.IO) {
+                runCatching { bound.post(RobotEndpoint.action(name)) }.recoverCatching { error ->
+                    if (isQueueFull(error) || !bound.send("action $name")) throw error
+                    "queued"
+                }
+            }
+            val failure = result.exceptionOrNull()
+            _state.update { current ->
+                current.copy(
+                    busy = false,
+                    detail = when {
+                        failure == null -> "$label queued"
+                        isQueueFull(failure) -> "Queue is full. One move is playing and two are waiting."
+                        else -> friendly(failure)
+                    }
+                )
+            }
+            if (failure == null || isQueueFull(failure)) {
+                withContext(Dispatchers.IO) { refreshAction(bound) }
+            }
+        }
+    }
+
+    fun stopStream() {
+        val bound = client
+        if (bound == null) {
+            _state.update { it.copy(detail = "Connect to Twist-auto first") }
+            return
+        }
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true, detail = "Stopping scan") }
+            stopLive()
+            val result = withContext(Dispatchers.IO) {
+                runCatching { postScan(bound, RobotEndpoint.SCAN_STOP, RobotEndpoint.STREAM_STOP) }
+            }
+            val failure = result.exceptionOrNull()
+            _state.update {
+                it.copy(
+                    busy = false,
+                    streaming = false,
+                    usingSocket = false,
+                    detail = if (failure == null) "Scan stopped. Motor is off." else friendly(failure)
+                )
+            }
+        }
+    }
 
     override fun onCleared() {
         liveJob?.cancel()
         mapJob?.cancel()
+        actionJob?.cancel()
         client?.close()
         client = null
         wifi.release()
@@ -196,43 +275,28 @@ class RobotViewModel(app: Application) : AndroidViewModel(app) {
     private fun adopt(found: Found) {
         liveJob?.cancel()
         mapJob?.cancel()
+        actionJob?.cancel()
         client?.close()
         client = found.client
         activeNetwork = found.network
-        fetchedVersion = Long.MIN_VALUE
         val parsed = RobotJson.status(found.status)
         Log.i(TAG, "Connected to ${RobotEndpoint.HOST}")
         _state.update {
             it.copy(
                 link = LinkState.Live,
                 statusLine = "Connected",
-                detail = "Hold the robot still, then calibrate front.",
+                detail = "LiDAR found. Motor is off until you start the scan.",
                 ssid = wifi.ssid() ?: RobotEndpoint.SSID,
                 lidar = parsed.lidar,
                 imu = parsed.imu,
-                streaming = parsed.streaming,
+                streaming = false,
                 yawDeg = parsed.yawDeg ?: it.yawDeg,
                 versions = parsed.versions.ifBlank { it.versions },
                 resolutionM = parsed.resolutionM ?: it.resolutionM
             )
         }
-        startLive(found.client)
-        refreshMap(found.client, null)
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { found.client.post(RobotEndpoint.START) }
-                .onSuccess {
-                    _state.update { current ->
-                        current.copy(
-                            streaming = true,
-                            detail = "Scan running. Hold the robot still, then calibrate front."
-                        )
-                    }
-                }
-                .onFailure { error ->
-                    _state.update { current -> current.copy(detail = friendly(error)) }
-                }
-            mergeCatalog(found.client)
-        }
+        viewModelScope.launch(Dispatchers.IO) { mergeCatalog(found.client) }
+        startActionPoll(found.client)
     }
 
     private suspend fun mergeCatalog(bound: RobotClient) {
@@ -242,7 +306,6 @@ class RobotViewModel(app: Application) : AndroidViewModel(app) {
             current.copy(
                 lidar = extra.lidar ?: current.lidar,
                 imu = extra.imu ?: current.imu,
-                streaming = extra.streaming ?: current.streaming,
                 versions = extra.versions.ifBlank { current.versions },
                 resolutionM = extra.resolutionM ?: current.resolutionM
             )
@@ -289,36 +352,81 @@ class RobotViewModel(app: Application) : AndroidViewModel(app) {
                 lastPacketMs = System.currentTimeMillis()
             )
         }
-        if (frame.mapVersion != null) refreshMap(bound, frame.mapVersion)
+        frame.mapVersion?.let { noteMapVersion(bound, it) }
     }
 
-    private fun refreshMap(bound: RobotClient, version: Long?) {
-        if (version != null && version == fetchedVersion) return
-        if (version != null) fetchedVersion = version
-        val generation = ++mapGeneration
-        mapJob?.cancel()
+    private fun noteMapVersion(bound: RobotClient, version: Long) {
+        if (version == seenMapVersion) return
+        seenMapVersion = version
+        if (mapJob?.isActive == true) {
+            mapFollowUp = true
+            return
+        }
+        pullMap(bound)
+    }
+
+    private fun pullMap(bound: RobotClient) {
         mapJob = viewModelScope.launch(Dispatchers.IO) {
             val bytes = runCatching { bound.getBytes(RobotEndpoint.MAP) }.getOrElse { error ->
-                if (version != null) fetchedVersion = Long.MIN_VALUE
-                _state.update { it.copy(detail = friendly(error)) }
-                return@launch
+                Log.i(TAG, "Map fetch failed: ${error.message}")
+                seenMapVersion = Long.MIN_VALUE
+                null
             }
-            if (!isActive || generation != mapGeneration) return@launch
-            val side = Frame.mapSide(bytes)
-            if (side == null) {
-                _state.update { it.copy(detail = "Map was ${bytes.size} bytes, expected a square grid") }
-                return@launch
+            val side = bytes?.let(Frame::mapSide)
+            if (bytes != null && side != null && client === bound && !bytes.contentEquals(_state.value.occupancy)) {
+                _state.update {
+                    it.copy(occupancy = bytes, mapSize = side, mapStamp = it.mapStamp + 1)
+                }
             }
-            _state.update { it.copy(occupancy = bytes, mapSize = side) }
+            if (mapFollowUp && isActive && client === bound) {
+                mapFollowUp = false
+                pullMap(bound)
+            }
         }
+    }
+
+    private fun stopLive() {
+        liveJob?.cancel()
+        liveJob = null
+        mapJob?.cancel()
+        mapJob = null
+        mapFollowUp = false
+    }
+
+    private fun postScan(bound: RobotClient, path: String, samePath: String): String {
+        return try {
+            bound.post(path)
+        } catch (error: Exception) {
+            Log.i(TAG, "$path failed: ${error.message}")
+            bound.post(samePath)
+        }
+    }
+
+    private fun startActionPoll(bound: RobotClient) {
+        actionJob?.cancel()
+        actionJob = viewModelScope.launch(Dispatchers.IO) {
+            while (isActive && client === bound) {
+                refreshAction(bound)
+                delay(800)
+            }
+        }
+    }
+
+    private fun refreshAction(bound: RobotClient) {
+        val body = runCatching { bound.get(RobotEndpoint.ACTION) }.getOrNull() ?: return
+        val snap = RobotJson.action(body) ?: return
+        if (client !== bound) return
+        _state.update { current -> current.withAction(snap) }
     }
 
     private fun refreshStatus(bound: RobotClient) {
         viewModelScope.launch(Dispatchers.IO) {
             val body = runCatching { bound.get(RobotEndpoint.STATUS) }.getOrNull() ?: return@launch
             val parsed = RobotJson.status(body)
+            val motion = RobotJson.action(body)
             _state.update { current ->
-                current.copy(
+                val withMotion = if (motion == null) current else current.withAction(motion)
+                withMotion.copy(
                     lidar = parsed.lidar ?: current.lidar,
                     imu = parsed.imu ?: current.imu,
                     streaming = parsed.streaming ?: current.streaming,
@@ -401,8 +509,9 @@ class RobotViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun dropLink(message: String) {
-        liveJob?.cancel()
-        mapJob?.cancel()
+        stopLive()
+        actionJob?.cancel()
+        actionJob = null
         client?.close()
         client = null
         activeNetwork = null
@@ -411,12 +520,34 @@ class RobotViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun isFresh(): Boolean {
-        val current = _state.value
-        return current.link == LinkState.Live &&
-            current.lastPacketMs > 0 &&
-            System.currentTimeMillis() - current.lastPacketMs < 2_000 &&
-            liveJob?.isActive == true
+    private fun motionLabel(name: String): String = when (name) {
+        "neutral" -> "Neutral"
+        "walk_forward" -> "Forward"
+        "walk_backward" -> "Back"
+        "turn_left" -> "Left"
+        "turn_right" -> "Right"
+        else -> name
+    }
+
+    private fun isQueueFull(error: Throwable): Boolean {
+        var current: Throwable? = error
+        while (current != null) {
+            if (current.message?.contains("HTTP 409") == true) return true
+            current = current.cause
+        }
+        return false
+    }
+
+    private fun RobotUiState.withAction(snap: ActionSnapshot): RobotUiState {
+        return copy(
+            actionBusy = snap.busy ?: actionBusy,
+            actionCurrent = if (snap.sawCurrent) snap.current else actionCurrent,
+            actionQueued = if (snap.sawQueued) snap.queued else actionQueued
+        )
+    }
+
+    private fun isLinked(): Boolean {
+        return _state.value.link == LinkState.Live && client != null
     }
 
     private fun friendly(error: Throwable): String {

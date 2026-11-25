@@ -23,9 +23,13 @@ data class RobotUiState(
     val mapVersion: Long = -1,
     val occupancy: ByteArray = ByteArray(0),
     val mapSize: Int = 0,
+    val mapStamp: Int = 0,
     val resolutionM: Double = 0.05,
     val versions: String = "",
     val busy: Boolean = false,
+    val actionBusy: Boolean? = null,
+    val actionCurrent: String? = null,
+    val actionQueued: List<String> = emptyList(),
     val lastPacketMs: Long = 0L,
     val usingSocket: Boolean = false
 )
